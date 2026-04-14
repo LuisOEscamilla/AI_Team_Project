@@ -8,6 +8,8 @@ An AI-driven tool to summarize product reviews using logic-based topic modeling 
 - Dataset acquired (Kaggle E-Commerce Reviews).
 - Logic-based topic inference engine implemented.
 - Transparency-focused trust scoring module (Ethics mitigation).
+- Per-topic sentiment analysis added
+- CSP filtering and optimized A* search added
 
 ### How to Run
 1. Place `Womens Clothing E-Commerce Reviews.csv` in the `/data` folder.
