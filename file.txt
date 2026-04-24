@@ -1,0 +1,636 @@
+logic_engine.py:
+import difflib
+from utils import tokenize
+
+
+class ReviewLogic:
+    def __init__(self):
+        # Rule-based topic keywords. Keys become predicate names.
+        self.rules = {
+            'Logistics': ['shipping', 'delivery', 'late', 'arrived', 'delayed'],
+            'Quality':   ['material', 'fabric', 'durable', 'broke', 'sturdy'],
+            'Fit':       ['size', 'small', 'large', 'tight', 'fit'],
+        }
+
+        # Sentiment polarity word lists
+        self._positive = ['great', 'love', 'perfect', 'excellent', 'amazing',
+                          'beautiful', 'comfortable', 'soft', 'flattering']
+        self._negative = ['bad', 'terrible', 'disappointed', 'poor', 'awful',
+                          'cheap', 'uncomfortable', 'stiff', 'returned']
+
+        # Negation words that can flip nearby keywords
+        self._negators = {'not', 'no', 'never', 'neither', 'nor',
+                          "didn't", "doesn't", "isn't", "wasn't",
+                          "won't", "wouldn't", "couldn't"}
+
+# Helpers
+
+
+    def _fuzzy_match(self, word, candidates, cutoff=0.85):
+        """
+        Return True if `word` is close enough to any candidate keyword.
+        Uses difflib SequenceMatcher; no extra dependencies needed.
+        """
+        matches = difflib.get_close_matches(word, candidates,
+                                            n=1, cutoff=cutoff)
+        return len(matches) > 0
+
+    def _is_negated(self, tokens, idx, window=2):
+        """
+        Check whether the token at `idx` is preceded by a negator
+        within `window` positions.
+        """
+        start = max(0, idx - window)
+        return any(tokens[j] in self._negators for j in range(start, idx))
+
+# Topic inference
+
+
+    def infer_topics(self, text):
+        """
+        Determines which topics (predicates) the review covers.
+        Uses fuzzy matching so misspellings still match, and respects negation
+        so "no delivery issues" does NOT trigger Logistics.
+
+        Returns a list of topic strings, e.g. ['Fit', 'Quality'].
+        Falls back to ['General'] if nothing matches.
+        """
+        tokens = tokenize(text)
+        matched = []
+        for topic, keywords in self.rules.items():
+            for idx, token in enumerate(tokens):
+                if self._fuzzy_match(token, keywords):
+                    if not self._is_negated(tokens, idx):
+                        matched.append(topic)
+                        break          # one match per topic is enough
+        return matched if matched else ['General']
+
+
+# Sentiment – now per-topic
+
+
+    def _sentiment_score(self, tokens):
+        """
+        Raw integer score for a token list: +1 per positive word,
+        -1 per negative word, with negation inversion.
+        """
+        score = 0
+        for idx, token in enumerate(tokens):
+            if self._fuzzy_match(token, self._positive):
+                score += -1 if self._is_negated(tokens, idx) else 1
+            elif self._fuzzy_match(token, self._negative):
+                score += 1 if self._is_negated(tokens, idx) else -1
+        return score
+
+    def _label(self, score):
+        return 'Positive' if score > 0 else ('Negative' if score < 0 else 'Neutral')
+
+    def sentiment_by_topic(self, text):
+        """
+        Returns a dict mapping each detected topic to a sentiment label.
+        Reviews that mention multiple topics get independent sentiment per topic.
+
+        Example:
+            "Love the fabric but the delivery was terrible"
+            → {'Quality': 'Positive', 'Logistics': 'Negative'}
+        """
+        topics = self.infer_topics(text)
+        tokens = tokenize(text)
+
+        if topics == ['General']:
+            return {'General': self._label(self._sentiment_score(tokens))}
+
+        results = {}
+        for topic in topics:
+            # Only score the tokens that are near a keyword for this topic
+            keywords = self.rules[topic]
+            # Find sentence fragments (~5-word windows) around each keyword hit
+            topic_tokens = []
+            for idx, token in enumerate(tokens):
+                if self._fuzzy_match(token, keywords):
+                    window_start = max(0, idx - 5)
+                    window_end = min(len(tokens), idx + 6)
+                    topic_tokens.extend(tokens[window_start:window_end])
+
+            score = self._sentiment_score(topic_tokens) if topic_tokens \
+                else self._sentiment_score(tokens)
+            results[topic] = self._label(score)
+
+        return results
+
+    def simple_sentiment(self, text):
+        """
+        Convenience method: single overall sentiment label.
+        Kept for backward-compatibility with existing pipeline code.
+        """
+        tokens = tokenize(text)
+        return self._label(self._sentiment_score(tokens))
+
+summarizer.py:
+"""
+summarizer.py  —  Review-of-Reviews main pipeline
+
+Pipeline order:
+    load_reviews  →  logic_engine  →  trust_score
+        →  CSP filter  →  A* search  →  print summary
+"""
+
+import heapq
+import os
+import pandas as pd
+import kagglehub
+from utils import load_reviews
+from logic_engine import ReviewLogic
+from trust_score import TrustAnalyzer
+
+
+# Step 1: Annotate each review with topics, sentiment, and trust
+
+def annotate(df, text_col='Review Text'):
+    """
+    Adds three columns to the DataFrame:
+      - topics         : list[str] – detected topic predicates
+      - sentiment_map  : dict[str, str] – per-topic sentiment
+      - trust          : float – trust score in [0, 1] (higher = more trusted)
+      - trust_reasons  : list[str] – human-readable flags
+    """
+    logic = ReviewLogic()
+    trust_analyzer = TrustAnalyzer()
+
+    topic_list, sentiment_list, trust_list, reason_list = [], [], [], []
+
+    for text in df[text_col]:
+        topics = logic.infer_topics(text)
+        sentiment_map = logic.sentiment_by_topic(text)
+        trust, reasons = trust_analyzer.trust_score(text)
+
+        topic_list.append(topics)
+        sentiment_list.append(sentiment_map)
+        trust_list.append(trust)
+        reason_list.append(reasons)
+
+    df = df.copy()
+    df['topics'] = topic_list
+    df['sentiment_map'] = sentiment_list
+    df['trust'] = trust_list
+    df['trust_reasons'] = reason_list
+    return df
+
+
+# Step 2: CSP filter — user-defined hard constraints
+
+
+def apply_constraints(df, constraints, text_col='Review Text'):
+    """
+    Filter the annotated DataFrame to only rows that satisfy ALL constraints.
+    """
+    original_len = len(df)
+    mask = pd.Series([True] * len(df), index=df.index)
+
+    min_trust = constraints.get('min_trust', None)
+    if min_trust is not None:
+        mask &= df['trust'] >= min_trust
+
+    required_topic = constraints.get('required_topic', None)
+    if required_topic:
+        mask &= df['topics'].apply(lambda t: required_topic in t)
+
+    sentiment_filter = constraints.get('sentiment_filter', None)
+    if sentiment_filter:
+        def matches_sentiment(smap):
+            return any(v == sentiment_filter for v in smap.values())
+        mask &= df['sentiment_map'].apply(matches_sentiment)
+
+    min_words = constraints.get('min_words', None)
+    if min_words is not None:
+        mask &= df[text_col].apply(lambda t: len(str(t).split()) >= min_words)
+
+    filtered = df[mask].reset_index(drop=True)
+    report = (
+        f"CSP: {original_len} reviews → {len(filtered)} passed "
+        f"({original_len - len(filtered)} filtered out). "
+        f"Constraints applied: {constraints}"
+    )
+    return filtered, report
+
+
+# Step 3: Faster A* search for optimal review subset
+
+
+def _coverage(selected_topics):
+    """Distinct topic count across a set of reviews."""
+    all_topics = set()
+    for t in selected_topics:
+        all_topics.update(t)
+    return len(all_topics)
+
+
+def _heuristic(remaining_reviews):
+    """
+    Heuristic: average trust of remaining reviews.
+    """
+    if not remaining_reviews:
+        return 0.0
+    return sum(r['trust'] for r in remaining_reviews) / len(remaining_reviews)
+
+
+def _candidate_priority(review):
+    """
+    Simple score for pruning before search.
+    Higher trust and more topics = more useful.
+    """
+    return review['trust'] + 0.15 * len(review['topics'])
+
+
+def astar_search(candidate_reviews, k=5, topic_weight=0.7, trust_weight=0.3,
+                 beam_width=120, max_candidates=25, max_expansions=4000):
+    """
+    Faster beam-limited A* search.
+
+    Key speed fixes:
+      - prune candidate pool first
+      - keep only top `beam_width` frontier states
+      - stop after `max_expansions`
+    """
+    n = len(candidate_reviews)
+    if n == 0:
+        return []
+
+    # ---------- prune candidates first ----------
+    candidate_reviews = sorted(
+        candidate_reviews,
+        key=_candidate_priority,
+        reverse=True
+    )[:max_candidates]
+
+    n = len(candidate_reviews)
+    k = min(k, n)
+
+    topic_rule_count = max(1, len(ReviewLogic().rules))
+
+    # heap item: (-f, g, selected_tuple, remaining_tuple)
+    initial_remaining = tuple(range(n))
+    init_h = _heuristic(candidate_reviews) * trust_weight
+    heap = [(-init_h, 0.0, tuple(), initial_remaining)]
+
+    best_solution = None
+    best_score = -1.0
+    visited = {}
+    expansions = 0
+
+    while heap and expansions < max_expansions:
+        # beam limit: keep only best frontier states
+        if len(heap) > beam_width:
+            heap = heapq.nsmallest(beam_width, heap)
+            heapq.heapify(heap)
+
+        neg_f, g, selected, remaining = heapq.heappop(heap)
+        f = -neg_f
+        expansions += 1
+
+        state_key = selected
+        if state_key in visited and visited[state_key] >= g:
+            continue
+        visited[state_key] = g
+
+        if len(selected) == k:
+            if g > best_score:
+                best_score = g
+                best_solution = selected
+            continue
+
+        if not remaining:
+            continue
+
+        current_topics = [candidate_reviews[i]['topics'] for i in selected]
+        current_topic_set = set()
+        for topics in current_topics:
+            current_topic_set.update(topics)
+
+        remaining_list = list(remaining)
+
+        # expand better next moves first
+        scored_next = []
+        for idx in remaining_list:
+            new_topics = set(current_topic_set)
+            new_topics.update(candidate_reviews[idx]['topics'])
+            added_topic_bonus = len(new_topics) - len(current_topic_set)
+            local_score = candidate_reviews[idx]['trust'] + 0.2 * added_topic_bonus
+            scored_next.append((local_score, idx))
+
+        scored_next.sort(reverse=True)
+
+        # only expand top few next moves from each state
+        for _, idx in scored_next[:10]:
+            new_selected = tuple(sorted(selected + (idx,)))
+            new_remaining = tuple(r for r in remaining_list if r != idx)
+
+            selected_topics = [candidate_reviews[s]['topics'] for s in new_selected]
+            cov = _coverage(selected_topics) / topic_rule_count
+            avg_trust = sum(candidate_reviews[s]['trust'] for s in new_selected) / len(new_selected)
+            new_g = topic_weight * cov + trust_weight * avg_trust
+
+            remaining_reviews_data = [candidate_reviews[r] for r in new_remaining]
+            h = _heuristic(remaining_reviews_data) * trust_weight
+            new_f = new_g + h
+
+            heapq.heappush(heap, (-new_f, new_g, new_selected, new_remaining))
+
+    if best_solution is None:
+        # fallback: greedy top-k by trust
+        sorted_idx = sorted(
+            range(n),
+            key=lambda i: candidate_reviews[i]['trust'],
+            reverse=True
+        )
+        best_solution = tuple(sorted(sorted_idx[:k]))
+
+    return [candidate_reviews[i] for i in best_solution]
+
+# Step 4: Pretty-print the summary
+
+def print_summary(selected_reviews, csp_report):
+    print("\n" + "=" * 60)
+    print("REVIEW SUMMARY")
+    print("=" * 60)
+    print(csp_report)
+    print(f"\nSelected {len(selected_reviews)} reviews via A* search:\n")
+
+    for i, r in enumerate(selected_reviews, 1):
+        text_preview = str(r['text'])[:120].replace('\n', ' ')
+        print(f"  [{i}] Topics:    {r['topics']}")
+        print(f"      Sentiment: {r['sentiment_map']}")
+        print(f"      Trust:     {r['trust']:.2f}")
+        if r.get('trust_reasons'):
+            print(f"      Flags:     {'; '.join(r['trust_reasons'])}")
+        print(f"      Preview:   \"{text_preview}...\"")
+        print()
+
+    all_topics = set()
+    for r in selected_reviews:
+        all_topics.update(r['topics'])
+    print(f"  Topic coverage: {sorted(all_topics)}")
+    print("=" * 60)
+
+
+# Main
+
+if __name__ == '__main__':
+    TEXT_COL = 'Review Text'
+
+    print("Downloading / locating dataset with kagglehub...")
+    dataset_path = kagglehub.dataset_download("nicapotato/womens-ecommerce-clothing-reviews")
+    DATA_PATH = os.path.join(dataset_path, "Womens Clothing E-Commerce Reviews.csv")
+
+    print(f"Dataset folder: {dataset_path}")
+    print(f"CSV path: {DATA_PATH}")
+
+    print("Loading reviews...")
+    df = load_reviews(DATA_PATH, text_col=TEXT_COL, sample_n=40)
+
+    print("Annotating with topics, sentiment, and trust scores...")
+    df = annotate(df, text_col=TEXT_COL)
+
+    constraints = {
+        'min_trust': 0.55,
+        'required_topic': None,
+        'sentiment_filter': None,
+        'min_words': 8,
+    }
+
+    print("Applying CSP constraints...")
+    filtered_df, csp_report = apply_constraints(df, constraints, text_col=TEXT_COL)
+
+    candidates = [
+        {
+            'text': row[TEXT_COL],
+            'topics': row['topics'],
+            'sentiment_map': row['sentiment_map'],
+            'trust': row['trust'],
+            'trust_reasons': row['trust_reasons'],
+        }
+        for _, row in filtered_df.iterrows()
+    ]
+
+    print("Running A* search for optimal review subset...")
+    selected = astar_search(
+        candidates,
+        k=5,
+        beam_width=120,
+        max_candidates=25,
+        max_expansions=4000
+    )
+
+    print_summary(selected, csp_report)
+
+trust_score.py:
+from utils import tokenize, type_token_ratio
+
+
+class TrustAnalyzer:
+    """
+    Computes a suspicion score in [0.0, 1.0] with transparent reasons.
+    Higher score = more suspicious (less trustworthy).
+
+    Design principle: every heuristic that flags a review must come with
+    a human-readable reason so affected users can understand the decision
+    (ethics requirement from Presentation I feedback).
+    """
+
+    # Weights for each heuristic signal (must sum to 1.0)
+    _WEIGHTS = {
+        'high_caps':         0.15,   # replaced raw >30% cap check
+        'low_info_density':  0.25,
+        'low_vocab_diversity':0.20,
+        'repetition':        0.20,
+        'exclamation_spam':  0.10,
+        'single_sentence':   0.10,
+    }
+
+    def calculate_suspicion(self, review_text):
+        """
+        Returns (suspicion_score: float, reasons: list[str]).
+
+        suspicion_score is the weighted sum of triggered heuristics,
+        capped at 1.0.
+        """
+        reasons = []
+        raw_scores = {}
+
+        text = str(review_text)
+        tokens = tokenize(text)
+        word_count = len(tokens)
+
+        # --- Heuristic 1: Extreme capitalisation ---
+        # Old threshold (>30%) was too aggressive — a single CAPS word in a
+        # short review would trigger it
+        # New threshold: >50% AND the review is at least 10 chars long.
+        if len(text) >= 10:
+            cap_ratio = sum(1 for c in text if c.isupper()) / len(text)
+            if cap_ratio > 0.50:
+                reasons.append("Very high capitalisation (possible spam or shouting)")
+                raw_scores['high_caps'] = 1.0
+        raw_scores.setdefault('high_caps', 0.0)
+
+        # --- Heuristic 2: Low information density (very short review) ---
+        if word_count < 5:
+            reasons.append("Low information density (fewer than 5 words)")
+            raw_scores['low_info_density'] = 1.0
+        elif word_count < 10:
+            raw_scores['low_info_density'] = 0.5
+        else:
+            raw_scores['low_info_density'] = 0.0
+
+        # --- Heuristic 3: Low vocabulary diversity ---
+        # A legitimate review uses varied language; bots/fakes repeat phrases.
+        ttr = type_token_ratio(text)
+        if word_count >= 10 and ttr < 0.40:
+            reasons.append("Low vocabulary diversity (type-token ratio {:.2f})".format(ttr))
+            raw_scores['low_vocab_diversity'] = 1.0
+        elif word_count >= 10 and ttr < 0.55:
+            raw_scores['low_vocab_diversity'] = 0.5
+        else:
+            raw_scores['low_vocab_diversity'] = 0.0
+
+        # --- Heuristic 4: Word repetition ---
+        # If any single word appears more than 30% of the total, flag it.
+        if tokens:
+            from collections import Counter
+            freq = Counter(tokens)
+            most_common_ratio = freq.most_common(1)[0][1] / word_count
+            if most_common_ratio > 0.30:
+                top_word = freq.most_common(1)[0][0]
+                reasons.append(
+                    "Repetitive content (word '{}' = {:.0%} of review)".format(
+                        top_word, most_common_ratio))
+                raw_scores['repetition'] = 1.0
+            else:
+                raw_scores['repetition'] = 0.0
+        else:
+            raw_scores['repetition'] = 0.0
+
+        # --- Heuristic 5: Exclamation mark spam ---
+        excl_count = text.count('!')
+        if excl_count >= 3:
+            reasons.append("Excessive exclamation marks ({})".format(excl_count))
+            raw_scores['exclamation_spam'] = min(1.0, excl_count / 5)
+        else:
+            raw_scores['exclamation_spam'] = 0.0
+
+        # --- Heuristic 6: Single-sentence review (lacks depth) ---
+        sentence_count = max(1, text.count('.') + text.count('!') + text.count('?'))
+        if sentence_count == 1 and word_count >= 5:
+            # Only penalise if it's not just inherently short (caught above)
+            reasons.append("Single-sentence review (limited context)")
+            raw_scores['single_sentence'] = 0.5
+        else:
+            raw_scores['single_sentence'] = 0.0
+
+        # Weighted sum
+        suspicion_score = sum(
+            raw_scores[k] * self._WEIGHTS[k]
+            for k in self._WEIGHTS
+        )
+
+        return round(min(suspicion_score, 1.0), 4), reasons
+
+    def trust_score(self, review_text):
+        """Convenience inverse: 1.0 = fully trusted, 0.0 = fully suspicious."""
+        suspicion, reasons = self.calculate_suspicion(review_text)
+        return round(1.0 - suspicion, 4), reasons
+
+utils.py:
+import re
+import pandas as pd
+
+
+def load_reviews(filepath, text_col='Review Text', sample_n=None, seed=42):
+    """
+    Load the CSV file and return a cleaned DataFrame.
+    Removes missing review text, removes duplicate reviews,
+    and can optionally take a smaller random sample.
+    """
+    # Read the CSV file into a DataFrame
+    df = pd.read_csv(filepath)
+
+    # Remove rows where the review text column is missing
+    df = df.dropna(subset=[text_col])
+
+    # Remove duplicate reviews based on the review text column
+    df = df.drop_duplicates(subset=[text_col])
+
+    # Reset the row index after cleaning
+    df = df.reset_index(drop=True)
+
+    # If a sample size is given, take a random sample of the reviews
+    if sample_n:
+        df = df.sample(n=min(sample_n, len(df)), random_state=seed).reset_index(drop=True)
+
+    # Return the cleaned DataFrame
+    return df
+
+
+def clean_text(text):
+    """
+    Clean and normalize review text.
+    Makes text lowercase, removes extra spaces,
+    and removes most special characters.
+    """
+    # Convert to string, lowercase it, and remove outer spaces
+    text = str(text).lower().strip()
+
+    # Replace non-alphanumeric characters except apostrophes with spaces
+    text = re.sub(r"[^a-z0-9\s']", " ", text)
+
+    # Replace multiple spaces/newlines with a single space
+    text = re.sub(r"\s+", " ", text)
+
+    # Return the cleaned text
+    return text
+
+
+def tokenize(text):
+    """Return the cleaned text as a list of word tokens."""
+    # Clean the text first, then split it into words
+    return clean_text(text).split()
+
+
+def type_token_ratio(text):
+    """
+    Measure vocabulary diversity.
+    Returns unique words divided by total words.
+    """
+    # Turn the text into tokens
+    tokens = tokenize(text)
+
+    # Avoid division by zero for empty text
+    if not tokens:
+        return 0.0
+
+    # Return unique token count divided by total token count
+    return len(set(tokens)) / len(tokens)
+
+
+def dedup_reviews(reviews):
+    """
+    Remove duplicate reviews from a list of raw review strings.
+    Uses cleaned text for comparison.
+    """
+    # Keep track of cleaned reviews already seen
+    seen = set()
+
+    # Store the final unique raw reviews
+    unique = []
+
+    # Check each review one by one
+    for r in reviews:
+        # Create a cleaned version to use as the duplicate-check key
+        key = clean_text(r)
+
+        # If this cleaned review has not been seen, keep it
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+
+    # Return the list of unique reviews
+    return unique
